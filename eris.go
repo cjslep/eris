@@ -7,7 +7,6 @@ import (
 	"encoding/base32"
 	"hash"
 	"io"
-	"fmt"
 
 	"golang.org/x/crypto/blake2b"
 	"golang.org/x/crypto/chacha20poly1305"
@@ -204,7 +203,6 @@ func toReadKey(content, secret []byte) ([]byte, error) {
 // nonce set to 0. If content is larger than 256 GB use nonce 0 for first 256 GB
 // and increment nonce for successive chunks of 256 GB.
 func encrypt(chunk, key []byte, nonce [nonceByteSize]byte) ([]byte, error) {
-	fmt.Printf("%v %v\n", len(key), key)
 	c, err := newSymmKeyCipher(key)
 	if err != nil {
 		return nil, err
