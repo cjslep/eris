@@ -166,7 +166,7 @@ func toBlock(content []byte) Block {
 // Content is first padded (see Cryptographic Primitives) to a multiple of
 // 4kB.
 func padContent(content []byte) []byte {
-	p := make([]byte, len(content)%blockSize)
+	p := make([]byte, blockSize - len(content)%blockSize)
 	pad(p)
 	return append(content, p...)
 }
