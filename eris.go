@@ -64,6 +64,7 @@ func Encode(r io.Reader, secret []byte) (root Root, l []Block, err error) {
 	var n int
 	var readErr error
 	n, readErr = chr.Read(b)
+	b = b[:n]
 
 	// TODO: How does determining the read key work with chunking a stream > 256GB?
 	var key []byte
@@ -72,7 +73,6 @@ func Encode(r io.Reader, secret []byte) (root Root, l []Block, err error) {
 		return
 	}
 
-	b = b[:n]
 	l, err = encodeChunkToDataBlocks(b, key, chunkNonce())
 	if err != nil {
 		return
