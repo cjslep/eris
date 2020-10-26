@@ -1,10 +1,8 @@
 package eris
 
 import (
-	"bytes"
 	"crypto/cipher"
 	"errors"
-	"encoding/base32"
 	"hash"
 	"io"
 
@@ -13,181 +11,183 @@ import (
 )
 
 const (
-	// Spec says kilo but it is kibi
+	// Kibi, base 2, definition
 	kb = 1024
 	mb = kb * 1024
 	gb = mb * 1024
 )
 
 const (
-	xPath         = 255
-	RefSize       = 32
-	refsPerNode   = 128
-	nonceByteSize = 12
-	blockSize     = 4 * kb
-	chunkSize     = 256 * gb
+	RefSize        = 32
+	blockSize      = 1 * kb
+	largeBlockSize = 32 * kb
 )
 
-type Block struct {
-	Ref [RefSize]byte
-	B   []byte
-}
+// ebytes is an encrypted set of bytes
+type ebytes []byte
 
-func (b Block) String() string {
-	// TODO: Base32 Hex or Std encoding?
-	return base32.StdEncoding.EncodeToString(b.Ref[:])
-}
+// ubytes is an unencrypted set of bytes
+type ubytes []byte
 
-type Root struct {
-	Ref [RefSize]byte
-	Level byte
-	ReadKey []byte
-}
-
-func (r Root) String() string {
-	// TODO: Base32 Hex or Std encoding?
-	b := make([]byte, 0, 67)
-	b = append(b, 0) // version
-	b = append(b, 0) // read cap
-	b = append(b, r.Level)
-	b = append(b, r.Ref[:]...)
-	b = append(b, r.ReadKey...)
-	return "urn:eris:" + base32.StdEncoding.EncodeToString(b)
-}
-
-func Encode(r io.Reader, secret []byte) (root Root, l []Block, err error) {
-	chr := newChunkReader(r)
-
-	// TODO: Support streaming due to open questions, for now let's just max out at 1gb.
-	b := make([]byte, 1*gb)
-	var n int
-	var readErr error
-	n, readErr = chr.Read(b)
-	b = b[:n]
-
-	// TODO: How does determining the read key work with chunking a stream > 256GB?
-	var key []byte
-	key, err = toReadKey(b, secret)
-	if err != nil {
-		return
-	}
-
-	l, err = encodeChunkToDataBlocks(b, key, chunkNonce())
-	if err != nil {
-		return
-	} else if readErr != io.EOF {
-		err = errors.New("unsupported: encoding larger than 1 GB")
-	}
-
-	var bl []Block
-	var level byte
-	bl, level, err = encodeTree(l, key, firstNonce(), 1)
-	l = append(l, bl...)
-
-	root = Root {
-		Ref: l[len(l)-1].Ref,
-		Level: level,
-		ReadKey: key,
-	}
-	return
-}
-
-func encodeTree(l []Block, key []byte, nonce [nonceByteSize]byte, level byte) (r []Block, outLevel byte, err error) {
-	// Base case: previous level is root
-	if len(l) == 1 {
-		return nil, level-1, nil
-	}
-
-	// Build the current Merkle tree level out
-	for len(l) > 0 {
-		plain := make([]byte, 0, blockSize)
-		var i int
-		for i = 0; i < len(l) && i < refsPerNode; i++ {
-			plain = append(plain, l[i].Ref[:]...)
+func EncodeV2(w writeFn, r io.Reader, secret []byte) error {
+	// TODO: determine size
+	size := largeBlockSize
+	mFn, fFn := newMarshaller(w, secret, size)
+	buf := make([]byte, size)
+	for {
+		n, err := io.ReadFull(r, buf)
+		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+			// Error reading.
+			return err
+		} else if n == 0 && err == io.EOF || // Do special closing padding block, then terminate; or...
+			err == io.ErrUnexpectedEOF { // ...pad current block, then terminate.
+			buf = padContentBlock(buf, size)
+			fFn, err = mFn(buf)
+			if err != nil {
+				return err
+			}
+			return fFn()
+		} else {
+			// Process block normally.
+			fFn, err = mFn(buf)
+			if err != nil {
+				return err
+			}
 		}
-		l = l[i:]
-		if len(plain) < blockSize {
-			plain = append(plain, missingRefs(blockSize-len(plain))...)
+	}
+}
+
+// TL;DR: Strategy is to build the tree up recursively, growing in log-space
+// memory requirements during single pass encoding.
+func newMarshaller(w writeFn, secret []byte, size int) (marshalFn, flushFn) {
+	acc, fl := recurAccumulateBlocks(w, secret, size, nil, nil)
+	m := recurMarshalBlocks(w, secret, acc)
+	return m, fl
+}
+
+type accumFn func(rkPair []byte) (accumFn, flushFn, error)
+type marshalFn func(ublock ubytes) (flushFn, error)
+type flushFn func() error
+type writeFn func(eblock ebytes, ref [RefSize]byte, readkey []byte) error
+
+func recurAccumulateBlocks(w writeFn, secret []byte, size int, parent marshalFn, parentFlush flushFn) (this accumFn, fl flushFn) {
+	rkPairs := make([]byte, size)
+	n := 0
+	// Here be dragons and dark magick
+	this = func(rkPair []byte) (accumFn, flushFn, error) {
+		copy(rkPairs[n:], rkPair[:])
+		n += len(rkPair)
+		if n > size {
+			return nil, nil, errors.New("invalid reference-key block size")
+		} else if n == size {
+			if parent == nil {
+				var parentAcc accumFn
+				parentAcc, parentFlush = recurAccumulateBlocks(w, secret, size, nil, nil)
+				parent = recurMarshalBlocks(w, secret, parentAcc)
+			}
+			var err error
+			parentFlush, err = parent(rkPairs)
+			if err != nil {
+				return nil, nil, err
+			}
+			a, f := recurAccumulateBlocks(w, secret, size, parent, parentFlush)
+			return a, f, nil
+		} else {
+			return this, fl, nil
 		}
-		var enc []byte
-		enc, err = encrypt(plain, /* TODO: Was verify key? */ key, nonce)
+	}
+	fl = func() error {
+		if n == 0 {
+			return nil
+		}
+		if parent == nil || parentFlush == nil {
+			return nil
+		}
+		var err error
+		parentFlush, err = parent(rkPairs)
 		if err != nil {
-			return
+			return err
 		}
-		r = append(r, toBlock(enc))
-		incrementNonceInPlace(nonce)
+		return parentFlush()
 	}
-
-	// Otherwise, recur upwards in the Merkle tree.
-	var above []Block
-	zerothNextXPathNonceInPlace(nonce)
-	above, outLevel, err = encodeTree(r, key, nonce, level+1)
-	r = append(r, above...)
 	return
 }
 
-func encodeChunkToDataBlocks(plain, key []byte, cNonce [nonceByteSize]byte) (l []Block, err error) {
-	// TODO: Since this is encrypted before enforcing block-chunking, cannot use same logic as merkle tree?
-	plain = padContent(plain)
-	var enc []byte
-	enc, err = encrypt(plain, key, cNonce)
+func recurMarshalBlocks(w writeFn, secret []byte, accFn accumFn) marshalFn {
+	return func(ublock ubytes) (flushFn, error) {
+		eblock, ref, readKey, err := marshalBlock(ublock, secret)
+		if err != nil {
+			return nil, err
+		}
+		err = w(eblock, ref, readKey)
+		if err != nil {
+			return nil, err
+		}
+		rkPair := append(ref[:], readKey...)
+		var fl flushFn
+		accFn, fl, err = accFn(rkPair)
+		return fl, err
+	}
+}
+
+func marshalBlock(ublock ubytes, secret []byte) (eblock ebytes, ref [RefSize]byte, readKey []byte, err error) {
+	// Get Read Key
+	readKey, err = toReadKey(ublock, secret)
 	if err != nil {
 		return
 	}
-
-	l = make([]Block, 0, len(plain)/blockSize)
-	r := bytes.NewReader(enc)
-	for r.Len() > 0 {
-		br := newBlockSizeReader(r)
-		b := make([]byte, blockSize)
-		n, readErr := br.Read(b)
-
-		l = append(l, toBlock(b[:n]))
-		if readErr != io.EOF {
-			err = readErr
-			return
-		}
+	// Encrypt
+	eblock, err = encrypt(ublock, readKey)
+	if err != nil {
+		return
 	}
+	// Get Reference
+	ref = toRef(eblock)
 	return
 }
 
-func toBlock(content []byte) Block {
-	return Block{
-		Ref: toRef(content),
-		B:   content,
+// padContentBlock pads the content to the nearest specified size.
+//
+// From 0.2 documentation:
+//
+// Input content is split into blocks of size at most block size such that only
+// the last content block may be smaller than block size.
+//
+// The last content block is always padded according to the padding algorithm to
+// block size. If the size of the padded last block is larger than block size it
+// is split into content blocks of block size.
+//
+// If the length of the last content block is exactly block size, then padding
+// will result in a padded block that is double the block size and must be
+// split.
+func padContentBlock(block ubytes, size int) ubytes {
+	n := size - len(block)%size
+	if n == 0 {
+		n = size
 	}
-}
-
-// padContent pads the content to the nearest blockSize.
-//
-// From the documentation:
-//
-// Content is first padded (see Cryptographic Primitives) to a multiple of
-// 4kB.
-func padContent(content []byte) []byte {
-	p := make([]byte, blockSize - len(content)%blockSize)
+	p := make([]byte, n)
 	pad(p)
-	return append(content, p...)
+	return append(block, p...)
 }
 
 // toReadKey computes a read symmetric key with an optional secret, which may be
 // nil.
 //
-// From the documentation:
+// From 0.2 documentation:
 //
-// The key used to encrypt the content. The read key is BLAKE2b(content). If a
-// convergence secret is given the read key is BLAKE2b(content,
-// key=covergence-secret) (using keyed hashing).
-func toReadKey(content, secret []byte) ([]byte, error) {
-	content = padContent(content)
+// 1.
+// Compute the hash of the unencrypted block. If a convergence secret is used
+// the convergence secret MUST be used as key of the hash function. The output
+// of the hash is the key.
+func toReadKey(block ubytes, secret []byte) ([]byte, error) {
 	h, err := newCryptoHash(secret)
 	if err != nil {
 		return nil, err
 	}
-	n, err := h.Write(content)
+	n, err := h.Write(block)
 	if err != nil {
 		return nil, err
-	} else if n != len(content) {
+	} else if n != len(block) {
 		return nil, errors.New("could not write all content bytes to hash")
 	}
 	key := h.Sum(nil)
@@ -196,94 +196,32 @@ func toReadKey(content, secret []byte) ([]byte, error) {
 
 // encrypt implements the encryption algorithm for a large chunk of plaintext.
 //
-// From the documentation:
+// From 0.2 documentation:
 //
-// Step 2:
-// Content is then encoded with the symmetric key cypher using the read key and
-// nonce set to 0. If content is larger than 256 GB use nonce 0 for first 256 GB
-// and increment nonce for successive chunks of 256 GB.
-func encrypt(chunk, key []byte, nonce [nonceByteSize]byte) ([]byte, error) {
+// 2.
+// Encrypt the block using the symmetric key cipher with the key.
+func encrypt(block ubytes, key []byte) (ebytes, error) {
 	c, err := newSymmKeyCipher(key)
 	if err != nil {
 		return nil, err
 	}
-	if len(nonce) != c.NonceSize() {
-		return nil, errors.New("nonce is of incorrect size")
-	}
+	// TODO: Nonce all-zero?
+	nonce := make([]byte, c.NonceSize())
 	// Encrypt in-place
-	return c.Seal(chunk[:0], nonce[:], chunk, nil), nil
+	return c.Seal(block[:0], nonce, block, nil), nil
 }
 
 // toRef determines the block reference for a block
 //
-// From the documentation:
+// From 0.2 documentation:
 //
-// Step 3:
-// Encrypted content is split into blocks of size 4kB. The blocks holding
-// encrypted content are called data blocks.
-func toRef(block []byte) [RefSize]byte {
-	return newRefHash(block)
-}
-
-/* Nonces for chunks */
-
-func chunkNonce() (b [nonceByteSize]byte) {
-	// All-zeroes
-	return
-}
-
-/* Nonce-management for internal nodes */
-
-func firstNonce() (b [nonceByteSize]byte) {
-	// All-zeroes
-	return
-}
-
-func zerothNextXPathNonceInPlace(b [nonceByteSize]byte) error {
-	if b[1] == xPath {
-		return errors.New("attempting to encode content too large: nonce path limit reached")
-	}
-	b[0] = 0
-	for i := 1; i < nonceByteSize-1; i++ {
-		if b[i+1] == xPath {
-			b[i] = xPath
-		} else {
-			b[i] = 0
-		}
-	}
-	b[nonceByteSize-1] = xPath
-	return nil
-}
-
-func incrementNonceInPlace(b [nonceByteSize]byte) error {
-	var i int
-	for i = nonceByteSize - 1; i >= 0; i-- {
-		if b[i] != xPath {
-			break
-		}
-	}
-	if i < 0 {
-		return errors.New("attempting to encode content too large: nonce path limit reached")
-	}
-	b[i]++ // Increment current
-	// Enforce base-128 encoding of position
-	i-- // Start examining second-128ths place
-	for i >= 0 && b[i+1] >= 128 {
-		b[i+1] = 0
-		b[i]++
-		i--
-	}
-	if i < 0 && b[0] >= 128 {
-		return errors.New("attempting to encode content too large: nonce base-128 encoding limit reached")
-	}
-	return nil
+// 3.
+// The hash of the encrypted block is used as reference to the encrypted block.
+func toRef(b ebytes) [RefSize]byte {
+	return newRefHash(b)
 }
 
 /* Specific crypto & implementation dependencies. */
-
-func newChunkReader(r io.Reader) io.Reader {
-	return io.LimitReader(r, chunkSize)
-}
 
 func newBlockSizeReader(r io.Reader) io.Reader {
 	return io.LimitReader(r, blockSize)
