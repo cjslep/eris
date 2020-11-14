@@ -8,7 +8,11 @@ import (
 	"io/ioutil"
 	"strings"
 	"testing"
+
+	"github.com/go-test/deep"
 )
+
+var _ Storage = new(TestVector)
 
 type TestVector struct {
 	Id                int                    `json:"id"`
@@ -22,11 +26,39 @@ type TestVector struct {
 	Blocks            map[string]interface{} `json:"blocks"`
 }
 
+func (t TestVector) Get(ref [RefSize]byte) ([]byte, error) {
+	sref := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(ref[:])
+	v, ok := t.Blocks[sref]
+	if !ok {
+		return nil, fmt.Errorf("test vector %d does not have ref=%s", t.Id, sref)
+	}
+	sv := v.(string)
+	return base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(sv)
+}
+
 type TestReadCap struct {
 	BlockSize BlockSize `json:"block-size"`
 	Level     int       `json:"level"`
 	RootRef   string    `json:"root-reference"`
 	RootKey   string    `json:"root-key"`
+}
+
+func (t TestReadCap) AsRef() (Ref, error) {
+	r := Ref{
+		BlockSize: t.BlockSize,
+		Level:     t.Level,
+	}
+	rbuf, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(t.RootRef)
+	if err != nil {
+		return r, err
+	}
+	kbuf, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(t.RootKey)
+	if err != nil {
+		return r, err
+	}
+	copy(r.Ref[:], rbuf)
+	copy(r.Key[:], kbuf)
+	return r, nil
 }
 
 var files []string = []string{
@@ -186,6 +218,44 @@ func TestEncodeVectors(t *testing.T) {
 			}
 			t.Logf("ref: %v", ref)
 			t.Logf("urn: %s", urn)
+		})
+	}
+}
+
+func TestDecodeVectors(t *testing.T) {
+	for _, file := range files {
+		b, err := ioutil.ReadFile("./testdata/" + file)
+		if err != nil {
+			t.Errorf("error reading %s: %v", file, err)
+			continue
+		}
+		var test TestVector
+		err = json.Unmarshal(b, &test)
+		if err != nil {
+			t.Errorf("error unmarshalling %s: %v", file, err)
+			continue
+		}
+		bcon, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(test.Content)
+		if err != nil {
+			t.Errorf("error decoding content %s: %v", file, err)
+			continue
+		}
+		rootRef, err := test.ReadCapability.AsRef()
+		if err != nil {
+			t.Errorf("error decoding read capability as ref %s: %v", file, err)
+			continue
+		}
+		t.Run(test.Name, func(t *testing.T) {
+			var buf bytes.Buffer
+			err := Decode(&test, &buf, rootRef)
+			if err != nil {
+				t.Errorf("got %s, want %v", err, nil)
+			}
+			bb := buf.Bytes()
+			diffs := deep.Equal(bb, bcon)
+			if len(diffs) > 0 {
+				t.Errorf("got diffs: %v", diffs)
+			}
 		})
 	}
 }
