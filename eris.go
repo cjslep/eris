@@ -1,13 +1,17 @@
 package eris
 
 import (
+	"bytes"
 	"crypto/cipher"
+	"encoding/base32"
 	"errors"
 	"hash"
 	"io"
+	"math"
+	"strings"
 
 	"golang.org/x/crypto/blake2b"
-	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/chacha20"
 )
 
 const (
@@ -18,10 +22,53 @@ const (
 )
 
 const (
-	RefSize        = 32
-	blockSize      = 1 * kb
-	largeBlockSize = 32 * kb
+	RefSize = 32
+	KeySize = 32
 )
+
+const (
+	erisURNVersion = "erisx2"
+)
+
+type BlockSize int
+
+const (
+	Size1KiB  BlockSize = 1 * kb
+	Size32KiB BlockSize = 32 * kb
+)
+
+type Ref struct {
+	BlockSize BlockSize
+	Level     int
+	Ref       [RefSize]byte
+	Key       [KeySize]byte
+}
+
+func (r Ref) URN() (string, error) {
+	// Prepare read capability in binary form
+	var bb bytes.Buffer
+	if r.BlockSize == Size1KiB {
+		bb.WriteByte(0)
+	} else if r.BlockSize == Size32KiB {
+		bb.WriteByte(1)
+	} else {
+		return "", errors.New("cannot create urn: unhandled block size")
+	}
+	if r.Level > math.MaxUint8 {
+		return "", errors.New("cannot create urn: level exceeds 1 byte depth")
+	}
+	bb.WriteByte(byte(r.Level))
+	bb.Write(r.Ref[:])
+	bb.Write(r.Key[:])
+
+	// Create the URN
+	var b strings.Builder
+	b.WriteString("urn:")
+	b.WriteString(erisURNVersion)
+	b.WriteString(":")
+	b.WriteString(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(bb.Bytes()))
+	return b.String(), nil
+}
 
 // ebytes is an encrypted set of bytes
 type ebytes []byte
@@ -29,29 +76,53 @@ type ebytes []byte
 // ubytes is an unencrypted set of bytes
 type ubytes []byte
 
-func EncodeV2(w writeFn, r io.Reader, secret []byte) error {
-	// TODO: determine size
-	size := largeBlockSize
-	mFn, fFn := newMarshaller(w, secret, size)
+// Encode1KiB encodes bytes from the given Reader into 1 kibibyte blocks,
+// emitting the blocks to the WriteFunc as data is streamed in from the
+// Reader. This allows encoding arbitrarily large data in-memory.
+//
+// Returns the root reference block.
+func Encode1KiB(w WriteFunc, r io.Reader, secret []byte) (ref Ref, err error) {
+	return encode(w, r, secret, Size1KiB)
+}
+
+// Encode32KiB encodes bytes from the given Reader into 32 kibibyte blocks,
+// emitting the blocks to the WriteFunc as data is streamed in from the
+// Reader. This allows encoding arbitrarily large data in-memory.
+//
+// Returns the root reference block.
+func Encode32KiB(w WriteFunc, r io.Reader, secret []byte) (ref Ref, err error) {
+	return encode(w, r, secret, Size32KiB)
+}
+
+// encode encodes bytes into a requested arbitrarily sized block.
+//
+// Allocates a single buffer of block-size.
+func encode(w WriteFunc, r io.Reader, secret []byte, size BlockSize) (ref Ref, err error) {
+	ref.BlockSize = size
+	var mFn marshalFn
+	var acc *accumulator
+	mFn, acc, err = newMarshaller(w, secret, size)
 	buf := make([]byte, size)
 	for {
-		n, err := io.ReadFull(r, buf)
+		var n int
+		n, err = io.ReadFull(r, buf)
 		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
 			// Error reading.
-			return err
+			return
 		} else if n == 0 && err == io.EOF || // Do special closing padding block, then terminate; or...
 			err == io.ErrUnexpectedEOF { // ...pad current block, then terminate.
-			buf = padContentBlock(buf, size)
-			fFn, err = mFn(buf)
+			buf = padContentBlock(buf[:n], size)
+			err = mFn(buf)
 			if err != nil {
-				return err
+				return
 			}
-			return fFn()
+			ref, err = acc.Flush()
+			return
 		} else {
 			// Process block normally.
-			fFn, err = mFn(buf)
+			err = mFn(buf)
 			if err != nil {
-				return err
+				return
 			}
 		}
 	}
@@ -59,78 +130,173 @@ func EncodeV2(w writeFn, r io.Reader, secret []byte) error {
 
 // TL;DR: Strategy is to build the tree up recursively, growing in log-space
 // memory requirements during single pass encoding.
-func newMarshaller(w writeFn, secret []byte, size int) (marshalFn, flushFn) {
-	acc, fl := recurAccumulateBlocks(w, secret, size, nil, nil)
-	m := recurMarshalBlocks(w, secret, acc)
-	return m, fl
+func newMarshaller(w WriteFunc, secret []byte, size BlockSize) (marshalFn, *accumulator, error) {
+	acc, err := newAccumulator(w, size, secret, 1, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	m := recurMarshalBlocks(w, secret, acc.RecurAccumulate)
+	return m, acc, nil
 }
 
-type accumFn func(rkPair []byte) (accumFn, flushFn, error)
-type marshalFn func(ublock ubytes) (flushFn, error)
-type flushFn func() error
-type writeFn func(eblock ebytes, ref [RefSize]byte, readkey []byte) error
+type accumFn func(r [RefSize]byte, k [KeySize]byte) error
+type marshalFn func(ublock ubytes) error
+type WriteFunc func(eblock ebytes, ref [RefSize]byte, readkey [KeySize]byte) error
 
-func recurAccumulateBlocks(w writeFn, secret []byte, size int, parent marshalFn, parentFlush flushFn) (this accumFn, fl flushFn) {
-	rkPairs := make([]byte, size)
-	n := 0
-	// Here be dragons and dark magick
-	this = func(rkPair []byte) (accumFn, flushFn, error) {
-		copy(rkPairs[n:], rkPair[:])
-		n += len(rkPair)
-		if n > size {
-			return nil, nil, errors.New("invalid reference-key block size")
-		} else if n == size {
-			if parent == nil {
-				var parentAcc accumFn
-				parentAcc, parentFlush = recurAccumulateBlocks(w, secret, size, nil, nil)
-				parent = recurMarshalBlocks(w, secret, parentAcc)
-			}
-			var err error
-			parentFlush, err = parent(rkPairs)
-			if err != nil {
-				return nil, nil, err
-			}
-			a, f := recurAccumulateBlocks(w, secret, size, parent, parentFlush)
-			return a, f, nil
-		} else {
-			return this, fl, nil
-		}
+// accumulator is responsible for accumulating references to blocks in a layer
+// below this accumulator. The accumulator is responsible for the recursive
+// construction of a tree bottom-up. A single accumulator instance's lifetime
+// will construct a single layer of the tree (all of a node and its siblings).
+// As new layers above are needed, more accumulators are automatically created.
+//
+// Each accumulator allocates a single buffer of block-size.
+type accumulator struct {
+	W      WriteFunc
+	Size   BlockSize
+	Level  int
+	Secret []byte
+	// Set non-nil-once state
+	Parent        *accumulator
+	ParentMarshal marshalFn
+	// mutable state
+	RefKeyPairs []byte
+	N           int
+}
+
+// newAccumulator creates a new accumulator with a properly-sized buffer.
+//
+// Enforces that the requested size is evenly divisible by RefSize + KeySize.
+func newAccumulator(w WriteFunc, size BlockSize, secret []byte, level int, parent *accumulator) (*accumulator, error) {
+	if size%(RefSize+KeySize) != 0 {
+		return nil, errors.New("requested block size is not an even multiple of reference-key pair size")
 	}
-	fl = func() error {
-		if n == 0 {
-			return nil
+	return &accumulator{
+		W:           w,
+		Size:        size,
+		Level:       level,
+		Secret:      secret,
+		Parent:      parent,
+		RefKeyPairs: make([]byte, size),
+		N:           0,
+	}, nil
+}
+
+// reset the buffer and index.
+func (a *accumulator) reset() {
+	for i := 0; i < len(a.RefKeyPairs); i++ {
+		a.RefKeyPairs[i] = 0
+	}
+	a.N = 0
+}
+
+// add the reference and key pair to the buffer, incrementing the index as
+// needed.
+func (a *accumulator) add(ref [RefSize]byte, key [KeySize]byte) {
+	copy(a.RefKeyPairs[a.N:a.N+RefSize], ref[:])
+	a.N += RefSize
+	copy(a.RefKeyPairs[a.N:a.N+KeySize], key[:])
+	a.N += KeySize
+}
+
+// RecurAccumulate accumulates reference-key pairs, forming a tree construction
+// as needed.
+//
+// Assumes that (RefSize + KeySize) divides into Size evenly.
+//
+// Enforces that the buffer is never empty.
+func (a *accumulator) RecurAccumulate(ref [RefSize]byte, key [KeySize]byte) error {
+	if a.N == int(a.Size) {
+		// We need to emit a complete block to be marshalled, in order
+		// to fit the new data.
+		//
+		// If there is no Parent layer to marshal our new block's
+		// reference-key pair into, create the above layer.
+		if a.Parent == nil {
+			var err error
+			a.Parent, err = newAccumulator(a.W, a.Size, a.Secret, a.Level+1, nil)
+			if err != nil {
+				return err
+			}
+			a.ParentMarshal = recurMarshalBlocks(a.W, a.Secret, a.Parent.RecurAccumulate)
 		}
-		if parent == nil || parentFlush == nil {
-			return nil
-		}
-		var err error
-		parentFlush, err = parent(rkPairs)
+		// Accumulate current references to parent
+		err := a.ParentMarshal(a.RefKeyPairs)
 		if err != nil {
 			return err
 		}
-		return parentFlush()
+		// Have this accumulate a new sibling block.
+		a.reset()
 	}
-	return
+	// Add the reference-key pair to the buffer, ensuring it respects the
+	// expected bounds.
+	a.add(ref, key)
+	if a.N > int(a.Size) {
+		return errors.New("adding reference-key exceeds block size")
+	}
+	return nil
 }
 
-func recurMarshalBlocks(w writeFn, secret []byte, accFn accumFn) marshalFn {
-	return func(ublock ubytes) (flushFn, error) {
+// Flush forces the conversion of existing buffers into blocks, returning the
+// root reference of the largest level singleton block.
+func (a *accumulator) Flush() (root Ref, err error) {
+	if a.Parent == nil {
+		// Root accumulator case -- flush "this"
+		// Special case: only 1 block reference. In this case, emit that
+		// reference-key pair as the root one.
+		if a.N == RefSize+KeySize {
+			root.Level = a.Level - 1
+			root.BlockSize = a.Size
+			copy(root.Ref[:], a.RefKeyPairs[:RefSize])
+			copy(root.Key[:], a.RefKeyPairs[RefSize:RefSize+KeySize])
+			return
+		}
+		// Root accumulator needs to flush multiple references to one
+		// new root block at this level.
+		root.Level = a.Level
+		root.BlockSize = a.Size
+		cls := func(ref [RefSize]byte, key [KeySize]byte) error {
+			copy(root.Ref[:], ref[:])
+			copy(root.Key[:], key[:])
+			return nil
+		}
+		a.ParentMarshal = recurMarshalBlocks(a.W, a.Secret, cls)
+		err = a.ParentMarshal(a.RefKeyPairs)
+		return
+	} else {
+		// Interior node case.
+		//
+		// Assume the buffer is never empty -- flush it to a new block
+		// for the parent to then handle as a final reference-key pair.
+		err = a.ParentMarshal(a.RefKeyPairs)
+		if err != nil {
+			return
+		}
+		return a.Parent.Flush()
+	}
+}
+
+// recurMarshalBlocks is a closure that allows calling the same accumFn for
+// multiple invocations, and emitting the block once it has been marshalled.
+// This allows a streaming emission of the blocks.
+func recurMarshalBlocks(w WriteFunc, secret []byte, accFn accumFn) marshalFn {
+	return func(ublock ubytes) error {
 		eblock, ref, readKey, err := marshalBlock(ublock, secret)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		err = w(eblock, ref, readKey)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		rkPair := append(ref[:], readKey...)
-		var fl flushFn
-		accFn, fl, err = accFn(rkPair)
-		return fl, err
+		return accFn(ref, readKey)
 	}
 }
 
-func marshalBlock(ublock ubytes, secret []byte) (eblock ebytes, ref [RefSize]byte, readKey []byte, err error) {
+// marshalBlock is the actual instruction set to marshal a chunk of
+// already-properly-sized bytes into a data block, with the given secret.
+//
+// The secret is allowed to be nil.
+func marshalBlock(ublock ubytes, secret []byte) (eblock ebytes, ref [RefSize]byte, readKey [KeySize]byte, err error) {
 	// Get Read Key
 	readKey, err = toReadKey(ublock, secret)
 	if err != nil {
@@ -160,12 +326,12 @@ func marshalBlock(ublock ubytes, secret []byte) (eblock ebytes, ref [RefSize]byt
 // If the length of the last content block is exactly block size, then padding
 // will result in a padded block that is double the block size and must be
 // split.
-func padContentBlock(block ubytes, size int) ubytes {
-	n := size - len(block)%size
+func padContentBlock(block ubytes, size BlockSize) ubytes {
+	n := int(size) - len(block)%int(size)
 	if n == 0 {
-		n = size
+		n = int(size)
 	}
-	p := make([]byte, n)
+	p := make([]byte, n) // TODO: Remove this allocation
 	pad(p)
 	return append(block, p...)
 }
@@ -179,19 +345,27 @@ func padContentBlock(block ubytes, size int) ubytes {
 // Compute the hash of the unencrypted block. If a convergence secret is used
 // the convergence secret MUST be used as key of the hash function. The output
 // of the hash is the key.
-func toReadKey(block ubytes, secret []byte) ([]byte, error) {
-	h, err := newCryptoHash(secret)
+func toReadKey(block ubytes, secret []byte) (rk [KeySize]byte, err error) {
+	var h hash.Hash
+	h, err = newCryptoHash(secret)
 	if err != nil {
-		return nil, err
+		return
 	}
-	n, err := h.Write(block)
+	var n int
+	n, err = h.Write(block)
 	if err != nil {
-		return nil, err
+		return
 	} else if n != len(block) {
-		return nil, errors.New("could not write all content bytes to hash")
+		err = errors.New("could not write all content bytes to hash")
+		return
 	}
 	key := h.Sum(nil)
-	return key, nil
+	if len(key) != KeySize {
+		err = errors.New("hash size is not equal to expected key size")
+		return
+	}
+	copy(rk[:], key[:KeySize])
+	return
 }
 
 // encrypt implements the encryption algorithm for a large chunk of plaintext.
@@ -200,15 +374,14 @@ func toReadKey(block ubytes, secret []byte) ([]byte, error) {
 //
 // 2.
 // Encrypt the block using the symmetric key cipher with the key.
-func encrypt(block ubytes, key []byte) (ebytes, error) {
+func encrypt(block ubytes, key [KeySize]byte) (ebytes, error) {
 	c, err := newSymmKeyCipher(key)
 	if err != nil {
 		return nil, err
 	}
-	// TODO: Nonce all-zero?
-	nonce := make([]byte, c.NonceSize())
 	// Encrypt in-place
-	return c.Seal(block[:0], nonce, block, nil), nil
+	c.XORKeyStream(block[:], block)
+	return ebytes(block), nil
 }
 
 // toRef determines the block reference for a block
@@ -223,10 +396,6 @@ func toRef(b ebytes) [RefSize]byte {
 
 /* Specific crypto & implementation dependencies. */
 
-func newBlockSizeReader(r io.Reader) io.Reader {
-	return io.LimitReader(r, blockSize)
-}
-
 func newCryptoHash(key []byte) (hash.Hash, error) {
 	return blake2b.New256(key)
 }
@@ -235,8 +404,9 @@ func newRefHash(block []byte) [RefSize]byte {
 	return blake2b.Sum256(block)
 }
 
-func newSymmKeyCipher(key []byte) (cipher.AEAD, error) {
-	return chacha20poly1305.New(key)
+func newSymmKeyCipher(key [KeySize]byte) (cipher.Stream, error) {
+	zNonce := make([]byte, chacha20.NonceSize) // TODO: Remove this allocation
+	return chacha20.NewUnauthenticatedCipher(key[:], zNonce)
 }
 
 func pad(b []byte) {
@@ -247,9 +417,4 @@ func pad(b []byte) {
 	for i := 1; i < len(b); i++ {
 		b[i] = 0
 	}
-}
-
-func missingRefs(n int) []byte {
-	// All-zeroes
-	return make([]byte, n)
 }
