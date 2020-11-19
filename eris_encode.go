@@ -141,7 +141,7 @@ func newMarshaller(w WriteFunc, secret []byte, size BlockSize) (marshalFn, *accu
 
 type accumFn func(r [RefSize]byte, k [KeySize]byte) error
 type marshalFn func(ublock ubytes) error
-type WriteFunc func(eblock ebytes, ref [RefSize]byte, readkey [KeySize]byte) error
+type WriteFunc func(eblock []byte, ref [RefSize]byte, readkey [KeySize]byte) error
 
 // accumulator is responsible for accumulating references to blocks in a layer
 // below this accumulator. The accumulator is responsible for the recursive
