@@ -65,7 +65,7 @@ func (t TestReadCap) AsRef() (Ref, error) {
 }
 
 var files []string = []string{
-	"test-vectors_eris-test-vector-00.json",
+	/*"test-vectors_eris-test-vector-00.json",
 	"test-vectors_eris-test-vector-01.json",
 	"test-vectors_eris-test-vector-02.json",
 	"test-vectors_eris-test-vector-03.json",
@@ -77,7 +77,8 @@ var files []string = []string{
 	"test-vectors_eris-test-vector-09.json",
 	"test-vectors_eris-test-vector-10.json",
 	"test-vectors_eris-test-vector-11.json",
-	"test-vectors_eris-test-vector-12.json",
+	"test-vectors_eris-test-vector-12.json",*/
+	"test-vectors_eris-test-vector-13.json",
 }
 
 type BlockAccumulator struct {
@@ -86,7 +87,7 @@ type BlockAccumulator struct {
 	K map[string]string
 }
 
-func (b *BlockAccumulator) Accumulate(eblock ebytes, ref [RefSize]byte, readKey [KeySize]byte) error {
+func (b *BlockAccumulator) Accumulate(eblock []byte, ref [RefSize]byte, readKey [KeySize]byte) error {
 	if b.N == 0 {
 		b.B = make(map[string]string)
 		b.K = make(map[string]string)
@@ -301,21 +302,29 @@ func TestStreamingEncode(t *testing.T) {
 		BlockSize     BlockSize
 		ContentLength int
 		ExpectedURN   string
+		ConvergenceSecret string
 	}{
-		/* TODO: Figure out why these are incorrect
+		{
+			Name: "Hello World!",
+			BlockSize: Size1KiB,
+			ContentLength: 1*kb,
+			ExpectedURN: "urn:erisx2:AAASC77CCCHLMNC2TFDQMCZ2747ZQGIJJPRFMCDQC7K3LBITVOVDHA3EDSZD3HSDLOOLBO5LYWTAWCEZ2O4X65KXB6Y3TESHVVVIVOEEYM",
+			ConvergenceSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+		},
 		{
 			Name:          "100MiB (block size 1KiB)",
 			BlockSize:     Size1KiB,
 			ContentLength: 100 * mb,
 			ExpectedURN:   "urn:erisx2:AACXPZNDNXFLO4IOMF6VIV2ZETGUJEUU7GN4AHPWNKEN6KJMCNP6YNUMVW2SCGZUJ4L3FHIXVECRZQ3QSBOTYPGXHN2WRBMB27NXDTAP24",
+			ConvergenceSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
 		},
 		{
 			Name:          "1GiB (block size 32KiB)",
 			BlockSize:     Size32KiB,
 			ContentLength: 1 * gb,
 			ExpectedURN:   "urn:erisx2:AEBFG37LU5BM5N3LXNPNMGAOQPZ5QTJAV22XEMX3EMSAMTP7EWOSD2I7AGEEQCTEKDQX7WCKGM6KQ5ALY5XJC4LMOYQPB2ZAFTBNDB6FAA",
+			ConvergenceSecret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
 		},
-		*/
 		// This test times out go's 10 minute built-in test timer.
 		/*		{
 					Name:          "256GiB (block size 32KiB)",
@@ -328,7 +337,7 @@ func TestStreamingEncode(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.Name, func(t *testing.T) {
 			nBlocks := 0
-			writeFunc := func(eblock ebytes, ref [RefSize]byte, readkey [KeySize]byte) error {
+			writeFunc := func(eblock []byte, ref [RefSize]byte, readkey [KeySize]byte) error {
 				nBlocks++
 				return nil
 			}
@@ -337,12 +346,17 @@ func TestStreamingEncode(t *testing.T) {
 				t.Errorf("error creating generator: %v", err)
 				return
 			}
+			bconv, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(test.ConvergenceSecret)
+			if err != nil {
+				t.Errorf("error decoding convergence secret %s: %v", test.Name, err)
+				return
+			}
 
 			var ref Ref
 			if test.BlockSize == Size1KiB {
-				ref, err = Encode1KiB(writeFunc, gen, nil)
+				ref, err = Encode1KiB(writeFunc, gen, bconv)
 			} else if test.BlockSize == Size32KiB {
-				ref, err = Encode32KiB(writeFunc, gen, nil)
+				ref, err = Encode32KiB(writeFunc, gen, bconv)
 			} else {
 				err = fmt.Errorf("unsupported test vector block size: %d", test.BlockSize)
 			}
@@ -363,7 +377,7 @@ func TestStreamingEncode(t *testing.T) {
 func BenchmarkStreamingEncode1KiB(b *testing.B) {
 	b.Logf("n=%d", b.N)
 	nBlocks := 0
-	writeFunc := func(eblock ebytes, ref [RefSize]byte, readkey [KeySize]byte) error {
+	writeFunc := func(eblock []byte, ref [RefSize]byte, readkey [KeySize]byte) error {
 		nBlocks++
 		return nil
 	}
@@ -390,7 +404,7 @@ func BenchmarkStreamingEncode1KiB(b *testing.B) {
 func BenchmarkStreamingEncode32KiB(b *testing.B) {
 	b.Logf("n=%d", b.N)
 	nBlocks := 0
-	writeFunc := func(eblock ebytes, ref [RefSize]byte, readkey [KeySize]byte) error {
+	writeFunc := func(eblock []byte, ref [RefSize]byte, readkey [KeySize]byte) error {
 		nBlocks++
 		return nil
 	}
